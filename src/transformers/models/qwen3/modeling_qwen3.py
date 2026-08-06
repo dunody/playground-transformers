@@ -263,8 +263,9 @@ class Qwen3Attention(nn.Module):
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
+        
+        device = hidden_states.device
+        cos, sin = position_embeddings[0].to(device), position_embeddings[1].to(device)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
@@ -360,12 +361,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx).to_empty(device='cuda:0')
         self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen3DecoderLayer(config, layer_idx).to_empty(device='cuda:0' if layer_idx < 18 else 'cuda:1') for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps).to_empty(device='cuda:1')
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config).to_empty(device='cuda:1')
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
@@ -421,9 +422,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            # check what decoder_layer's device is then move the hidden_state and position_ids to that device
+            device = device='cuda:0' if i < 18 else 'cuda:1'
+            print(device)
+            hidden_states = hidden_states.to(device)
+            attention_mask = causal_mask_mapping[self.config.layer_types[i]].to(device) if causal_mask_mapping[self.config.layer_types[i]] is not None else None
+            position_embeddings = position_embeddings
+            position_ids = position_ids.to(device)
+
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[self.config.layer_types[i]],
+                attention_mask=attention_mask,
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -448,7 +457,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False).to_empty(device="cuda:1")
 
         # Initialize weights and apply final processing
         self.post_init()
